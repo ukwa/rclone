@@ -20,7 +20,7 @@ func globToRegexp(glob string, ignoreCase bool) (*regexp.Regexp, error) {
 	}
 	if strings.HasPrefix(glob, "/") {
 		glob = glob[1:]
-		_, _ = re.WriteRune('^')
+		_ = re.WriteByte('^')
 	} else {
 		_, _ = re.WriteString("(^|/)")
 	}
@@ -39,13 +39,43 @@ func globToRegexp(glob string, ignoreCase bool) (*regexp.Regexp, error) {
 		consecutiveStars = 0
 		return nil
 	}
+	overwriteLastChar := func(c byte) {
+		buf := re.Bytes()
+		buf[len(buf)-1] = c
+	}
 	inBraces := false
 	inBrackets := 0
 	slashed := false
+	inRegexp := false    // inside {{ ... }}
+	inRegexpEnd := false // have received }} waiting for more
+	var next, last rune
 	for _, c := range glob {
+		next, last = c, next
 		if slashed {
 			_, _ = re.WriteRune(c)
 			slashed = false
+			continue
+		}
+		if inRegexpEnd {
+			if c == '}' {
+				// Regexp is ending with }} choose longest segment
+				// Replace final ) with }
+				overwriteLastChar('}')
+				_ = re.WriteByte(')')
+				continue
+			} else {
+				inRegexpEnd = false
+			}
+		}
+		if inRegexp {
+			if c == '}' && last == '}' {
+				inRegexp = false
+				inRegexpEnd = true
+				// Replace final } with )
+				overwriteLastChar(')')
+			} else {
+				_, _ = re.WriteRune(c)
+			}
 			continue
 		}
 		if c != '*' {
@@ -79,24 +109,30 @@ func globToRegexp(glob string, ignoreCase bool) (*regexp.Regexp, error) {
 			return nil, errors.Errorf("mismatched ']' in glob %q", glob)
 		case '{':
 			if inBraces {
-				return nil, errors.Errorf("can't nest '{' '}' in glob %q", glob)
+				if last == '{' {
+					inRegexp = true
+					inBraces = false
+				} else {
+					return nil, errors.Errorf("can't nest '{' '}' in glob %q", glob)
+				}
+			} else {
+				inBraces = true
+				_ = re.WriteByte('(')
 			}
-			inBraces = true
-			_, _ = re.WriteRune('(')
 		case '}':
 			if !inBraces {
 				return nil, errors.Errorf("mismatched '{' and '}' in glob %q", glob)
 			}
-			_, _ = re.WriteRune(')')
+			_ = re.WriteByte(')')
 			inBraces = false
 		case ',':
 			if inBraces {
-				_, _ = re.WriteRune('|')
+				_ = re.WriteByte('|')
 			} else {
 				_, _ = re.WriteRune(c)
 			}
 		case '.', '+', '(', ')', '|', '^', '$': // regexp meta characters not dealt with above
-			_, _ = re.WriteRune('\\')
+			_ = re.WriteByte('\\')
 			_, _ = re.WriteRune(c)
 		default:
 			_, _ = re.WriteRune(c)
@@ -112,7 +148,10 @@ func globToRegexp(glob string, ignoreCase bool) (*regexp.Regexp, error) {
 	if inBraces {
 		return nil, errors.Errorf("mismatched '{' and '}' in glob %q", glob)
 	}
-	_, _ = re.WriteRune('$')
+	if inRegexp {
+		return nil, errors.Errorf("mismatched '{{' and '}}' in glob %q", glob)
+	}
+	_ = re.WriteByte('$')
 	result, err := regexp.Compile(re.String())
 	if err != nil {
 		return nil, errors.Wrapf(err, "bad glob pattern %q (regexp %q)", glob, re.String())
@@ -121,8 +160,10 @@ func globToRegexp(glob string, ignoreCase bool) (*regexp.Regexp, error) {
 }
 
 var (
-	// Can't deal with / or ** in {}
-	tooHardRe = regexp.MustCompile(`{[^{}]*(\*\*|/)[^{}]*}`)
+	// Can't deal with
+	//   / or ** in {}
+	//   {{ regexp }}
+	tooHardRe = regexp.MustCompile(`({[^{}]*(\*\*|/)[^{}]*})|\{\{|\}\}`)
 
 	// Squash all /
 	squashSlash = regexp.MustCompile(`/{2,}`)
