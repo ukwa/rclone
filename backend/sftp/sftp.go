@@ -39,6 +39,8 @@ import (
 )
 
 const (
+	defaultRemoteShell      = "unix"
+	remoteShellNotSupported = "none"
 	hashCommandNotSupported = "none"
 	minSleep                = 100 * time.Millisecond
 	maxSleep                = 2 * time.Second
@@ -46,7 +48,9 @@ const (
 )
 
 var (
-	currentUser = env.CurrentUser()
+	currentUser          = env.CurrentUser()
+	posixWinAbsPathRegex = regexp.MustCompile(`^/[a-zA-Z]\:($|/)`) // E.g. "/C:" or anything starting with "/C:/"
+	unixShellEscapeRegex = regexp.MustCompile("[^A-Za-z0-9_.,:/\\@\u0080-\uFFFFFFFF\n-]")
 )
 
 func init() {
@@ -145,24 +149,44 @@ If this is set and no password is supplied then rclone will:
 		}, {
 			Name:    "path_override",
 			Default: "",
-			Help: `Override path used by SSH connection.
+			Help: `Override path used by SSH shell commands.
 
 This allows checksum calculation when SFTP and SSH paths are
 different. This issue affects among others Synology NAS boxes.
 
-Shared folders can be found in directories representing volumes
+E.g. if shared folders can be found in directories representing volumes:
 
-    rclone sync /home/local/directory remote:/directory --ssh-path-override /volume2/directory
+    rclone sync /home/local/directory remote:/directory --sftp-path-override /volume2/directory
 
-Home directory can be found in a shared folder called "home"
+E.g. if home directory can be found in a shared folder called "home":
 
-    rclone sync /home/local/directory remote:/home/directory --ssh-path-override /volume1/homes/USER/directory`,
+    rclone sync /home/local/directory remote:/home/directory --sftp-path-override /volume1/homes/USER/directory`,
 			Advanced: true,
 		}, {
 			Name:     "set_modtime",
 			Default:  true,
 			Help:     "Set the modified time on the remote if set.",
 			Advanced: true,
+		}, {
+			Name:     "remote_shell",
+			Default:  "",
+			Help:     "The type of SSH shell on remote server, if any.\n\nLeave blank for autodetect.",
+			Advanced: true,
+			Examples: []fs.OptionExample{
+				{
+					Value: remoteShellNotSupported,
+					Help:  "No shell access",
+				}, {
+					Value: "unix",
+					Help:  "Unix shell",
+				}, {
+					Value: "powershell",
+					Help:  "PowerShell",
+				}, {
+					Value: "cmd",
+					Help:  "Windows Command Prompt",
+				},
+			},
 		}, {
 			Name:     "md5sum_command",
 			Default:  "",
@@ -267,6 +291,7 @@ type Options struct {
 	AskPassword             bool        `config:"ask_password"`
 	PathOverride            string      `config:"path_override"`
 	SetModTime              bool        `config:"set_modtime"`
+	RemoteShell             string      `config:"remote_shell"`
 	Md5sumCommand           string      `config:"md5sum_command"`
 	Sha1sumCommand          string      `config:"sha1sum_command"`
 	SkipLinks               bool        `config:"skip_links"`
@@ -283,6 +308,8 @@ type Fs struct {
 	name         string
 	root         string
 	absRoot      string
+	shellRoot    string
+	remoteShell  string
 	opt          Options          // parsed options
 	ci           *fs.ConfigInfo   // global config
 	m            configmap.Mapper // config
@@ -513,7 +540,7 @@ func (f *Fs) drainPool(ctx context.Context) (err error) {
 		f.drain.Stop()
 	}
 	if len(f.pool) != 0 {
-		fs.Debugf(f, "closing %d unused connections", len(f.pool))
+		fs.Debugf(f, "Closing %d unused connections", len(f.pool))
 	}
 	for i, c := range f.pool {
 		if cErr := c.closed(); cErr == nil {
@@ -710,7 +737,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 //
 // Just send the password back for all questions
 func (f *Fs) keyboardInteractiveReponse(user, instruction string, questions []string, echos []bool, pass string) ([]string, error) {
-	fs.Debugf(f, "keyboard interactive auth requested")
+	fs.Debugf(f, "Keyboard interactive auth requested")
 	answers := make([]string, len(questions))
 	for i := range answers {
 		answers[i] = pass
@@ -740,6 +767,7 @@ func NewFsWithConnection(ctx context.Context, f *Fs, name string, root string, m
 	f.name = name
 	f.root = root
 	f.absRoot = root
+	f.shellRoot = root
 	f.opt = *opt
 	f.m = m
 	f.config = sshConfig
@@ -749,7 +777,7 @@ func NewFsWithConnection(ctx context.Context, f *Fs, name string, root string, m
 	f.savedpswd = ""
 	// set the pool drainer timer going
 	if f.opt.IdleTimeout > 0 {
-		f.drain = time.AfterFunc(time.Duration(opt.IdleTimeout), func() { _ = f.drainPool(ctx) })
+		f.drain = time.AfterFunc(time.Duration(f.opt.IdleTimeout), func() { _ = f.drainPool(ctx) })
 	}
 
 	f.features = (&fs.Features{
@@ -761,16 +789,59 @@ func NewFsWithConnection(ctx context.Context, f *Fs, name string, root string, m
 	if err != nil {
 		return nil, errors.Wrap(err, "NewFs")
 	}
-	cwd, err := c.sftpClient.Getwd()
-	f.putSftpConnection(&c, nil)
-	if err != nil {
-		fs.Debugf(f, "Failed to read current directory - using relative paths: %v", err)
-	} else if !path.IsAbs(f.root) {
-		f.absRoot = path.Join(cwd, f.root)
-		fs.Debugf(f, "Using absolute root directory %q", f.absRoot)
+	// Check remote shell type, try to auto-detect if not configured and save to config for later
+	if f.opt.RemoteShell != "" {
+		f.remoteShell = f.opt.RemoteShell
+		fs.Debugf(f, "Shell type %q set from config", f.remoteShell)
+	} else {
+		session, err := c.sshClient.NewSession()
+		if err != nil {
+			f.remoteShell = remoteShellNotSupported
+			fs.Debugf(f, "Failed to get shell session for shell type detection command: %v", err)
+		} else {
+			var stdout, stderr bytes.Buffer
+			session.Stdout = &stdout
+			session.Stderr = &stderr
+			shellCmd := "echo ${ShellId}%ComSpec%"
+			fs.Debugf(f, "Running shell type detection command: %s", shellCmd)
+			err = session.Run(shellCmd)
+			_ = session.Close()
+			if err != nil {
+				f.remoteShell = defaultRemoteShell
+				fs.Debugf(f, "Command failed: %v (stdout=%v) (stderr=%v)", err, bytes.TrimSpace(stdout.Bytes()), bytes.TrimSpace(stderr.Bytes()))
+			} else {
+				outBytes := stdout.Bytes()
+				fs.Debugf(f, "Command output: %s", outBytes)
+				outString := string(bytes.TrimSpace(stdout.Bytes()))
+				if strings.HasPrefix(outString, "Microsoft.PowerShell") { // If PowerShell: "Microsoft.PowerShell%ComSpec%"
+					f.remoteShell = "powershell"
+				} else if !strings.HasSuffix(outString, "%ComSpec%") { // If Command Prompt: "${ShellId}C:\WINDOWS\system32\cmd.exe"
+					f.remoteShell = "cmd"
+				} else { // If Unix: "%ComSpec%"
+					f.remoteShell = "unix"
+				}
+			}
+		}
+		// Save permanently in config to avoid the extra work next time
+		fs.Debugf(f, "Shell type %q detected (set option remote_shell to override)", f.remoteShell)
+		f.m.Set("remote_shell", f.remoteShell)
 	}
+	// Ensure we have absolute path to root
+	// It appears that WS FTP doesn't like relative paths,
+	// and the openssh sftp tool also uses absolute paths.
+	if !path.IsAbs(f.root) {
+		path, err := c.sftpClient.RealPath(f.root)
+		if err != nil {
+			fs.Debugf(f, "Failed to resolve path - using relative paths: %v", err)
+		} else {
+			f.absRoot = path
+			fs.Debugf(f, "Relative path resolved to %q", f.absRoot)
+		}
+	}
+	f.putSftpConnection(&c, err)
 	if root != "" {
-		// Check to see if the root actually an existing file
+		// Check to see if the root is actually an existing file,
+		// and if so change the filesystem root to its parent directory.
 		oldAbsRoot := f.absRoot
 		remote := path.Base(root)
 		f.root = path.Dir(root)
@@ -778,20 +849,24 @@ func NewFsWithConnection(ctx context.Context, f *Fs, name string, root string, m
 		if f.root == "." {
 			f.root = ""
 		}
-		_, err := f.NewObject(ctx, remote)
+		_, err = f.NewObject(ctx, remote)
 		if err != nil {
-			if err == fs.ErrorObjectNotFound || err == fs.ErrorIsDir {
-				// File doesn't exist so return old f
-				f.root = root
-				f.absRoot = oldAbsRoot
-				return f, nil
+			if err != fs.ErrorObjectNotFound && err != fs.ErrorIsDir {
+				return nil, err
 			}
-			return nil, err
+			// File doesn't exist so keep the old f
+			f.root = root
+			f.absRoot = oldAbsRoot
+			err = nil
+		} else {
+			// File exists so change fs to point to the parent and return it with an error
+			err = fs.ErrorIsFile
 		}
-		// return an error with an fs which points to the parent
-		return f, fs.ErrorIsFile
+	} else {
+		err = nil
 	}
-	return f, nil
+	fs.Debugf(f, "Using root directory %q", f.absRoot)
+	return f, err
 }
 
 // Name returns the configured name of the file system
@@ -1094,25 +1169,23 @@ func (f *Fs) run(ctx context.Context, cmd string) ([]byte, error) {
 
 	c, err := f.getSftpConnection(ctx)
 	if err != nil {
-		return nil, errors.Wrap(err, "run: get SFTP connection")
+		return nil, errors.Wrap(err, "failed to get connection for run")
 	}
 	defer f.putSftpConnection(&c, err)
 
 	session, err := c.sshClient.NewSession()
 	if err != nil {
-		return nil, errors.Wrap(err, "run: get SFTP session")
+		return nil, errors.Wrap(err, "failed to open session for run")
 	}
-	defer func() {
-		_ = session.Close()
-	}()
 
 	var stdout, stderr bytes.Buffer
 	session.Stdout = &stdout
 	session.Stderr = &stderr
 
 	err = session.Run(cmd)
+	_ = session.Close()
 	if err != nil {
-		return nil, errors.Wrapf(err, "failed to run %q: %s", cmd, stderr.Bytes())
+		return nil, errors.Wrapf(err, "run failed: %s", stderr.Bytes())
 	}
 
 	return stdout.Bytes(), nil
@@ -1121,74 +1194,144 @@ func (f *Fs) run(ctx context.Context, cmd string) ([]byte, error) {
 // Hashes returns the supported hash types of the filesystem
 func (f *Fs) Hashes() hash.Set {
 	ctx := context.TODO()
-	if f.opt.DisableHashCheck {
-		return hash.Set(hash.None)
-	}
 
 	if f.cachedHashes != nil {
 		return *f.cachedHashes
 	}
 
+	hashSet := hash.NewHashSet()
+	f.cachedHashes = &hashSet
+
+	if f.opt.DisableHashCheck || f.remoteShell == remoteShellNotSupported {
+		return hashSet
+	}
+
 	// look for a hash command which works
-	checkHash := func(commands []string, expected string, hashCommand *string, changed *bool) bool {
+	checkHash := func(hashType hash.Type, commands []struct{ hashFile, hashEmpty string }, expected string, hashCommand *string, changed *bool) bool {
 		if *hashCommand == hashCommandNotSupported {
 			return false
 		}
 		if *hashCommand != "" {
 			return true
 		}
+		fs.Debugf(f, "Checking default %v hash commands", hashType)
 		*changed = true
 		for _, command := range commands {
-			output, err := f.run(ctx, command)
+			fs.Debugf(f, "Running shell command: %s", command.hashEmpty)
+			output, err := f.run(ctx, command.hashEmpty)
 			if err != nil {
+				fs.Debugf(f, "Command failed: %v", err)
 				continue
 			}
 			output = bytes.TrimSpace(output)
-			fs.Debugf(f, "checking %q command: %q", command, output)
+			fs.Debugf(f, "Command output: %s", output)
 			if parseHash(output) == expected {
-				*hashCommand = command
+				*hashCommand = command.hashFile
+				fs.Debugf(f, "Correct output, hash command selected")
 				return true
 			}
+			fs.Debugf(f, "Wrong output, hash command skipped")
 		}
 		*hashCommand = hashCommandNotSupported
 		return false
 	}
 
 	changed := false
-	md5Works := checkHash([]string{"md5sum", "md5 -r"}, "d41d8cd98f00b204e9800998ecf8427e", &f.opt.Md5sumCommand, &changed)
-	sha1Works := checkHash([]string{"sha1sum", "sha1 -r"}, "da39a3ee5e6b4b0d3255bfef95601890afd80709", &f.opt.Sha1sumCommand, &changed)
+	md5Commands := []struct {
+		hashFile, hashEmpty string
+	}{
+		{"md5sum", "md5sum"},
+		{"md5 -r", "md5 -r"},
+	}
+	sha1Commands := []struct {
+		hashFile, hashEmpty string
+	}{
+		{"sha1sum", "sha1sum"},
+		{"sha1 -r", "sha1 -r"},
+	}
+	if f.remoteShell == "powershell" {
+		md5Commands = append(md5Commands, struct {
+			hashFile, hashEmpty string
+		}{
+			"&{param($Path);Get-FileHash -Algorithm MD5 -LiteralPath $Path -ErrorAction Stop|Select-Object -First 1 -ExpandProperty Hash|ForEach-Object{\"$($_.ToLower())  ${Path}\"}}",
+			"Get-FileHash -Algorithm MD5 -InputStream ([System.IO.MemoryStream]::new()) -ErrorAction Stop|Select-Object -First 1 -ExpandProperty Hash|ForEach-Object{$_.ToLower()}",
+		})
+
+		sha1Commands = append(sha1Commands, struct {
+			hashFile, hashEmpty string
+		}{
+			"&{param($Path);Get-FileHash -Algorithm SHA1 -LiteralPath $Path -ErrorAction Stop|Select-Object -First 1 -ExpandProperty Hash|ForEach-Object{\"$($_.ToLower())  ${Path}\"}}",
+			"Get-FileHash -Algorithm SHA1 -InputStream ([System.IO.MemoryStream]::new()) -ErrorAction Stop|Select-Object -First 1 -ExpandProperty Hash|ForEach-Object{$_.ToLower()}",
+		})
+	}
+
+	md5Works := checkHash(hash.MD5, md5Commands, "d41d8cd98f00b204e9800998ecf8427e", &f.opt.Md5sumCommand, &changed)
+	sha1Works := checkHash(hash.SHA1, sha1Commands, "da39a3ee5e6b4b0d3255bfef95601890afd80709", &f.opt.Sha1sumCommand, &changed)
 
 	if changed {
+		// Save permanently in config to avoid the extra work next time
+		fs.Debugf(f, "Setting hash command for %v to %q (set sha1sum_command to override)", hash.MD5, f.opt.Md5sumCommand)
 		f.m.Set("md5sum_command", f.opt.Md5sumCommand)
+		fs.Debugf(f, "Setting hash command for %v to %q (set md5sum_command to override)", hash.SHA1, f.opt.Sha1sumCommand)
 		f.m.Set("sha1sum_command", f.opt.Sha1sumCommand)
 	}
 
-	set := hash.NewHashSet()
 	if sha1Works {
-		set.Add(hash.SHA1)
+		hashSet.Add(hash.SHA1)
 	}
 	if md5Works {
-		set.Add(hash.MD5)
+		hashSet.Add(hash.MD5)
 	}
 
-	f.cachedHashes = &set
-	return set
+	return hashSet
 }
 
 // About gets usage stats
 func (f *Fs) About(ctx context.Context) (*fs.Usage, error) {
-	escapedPath := shellEscape(f.root)
-	if f.opt.PathOverride != "" {
-		escapedPath = shellEscape(path.Join(f.opt.PathOverride, f.root))
+	if f.remoteShell == remoteShellNotSupported || f.remoteShell == "cmd" {
+		fs.Debugf(f, "About shell command is not available for shell type %q (set option remote_shell to override)", f.remoteShell)
+		return nil, fmt.Errorf("your remote with shell type %q does not support About", f.remoteShell)
 	}
-	if len(escapedPath) == 0 {
-		escapedPath = "/"
+	aboutShellPath := f.remoteShellPath("")
+	if aboutShellPath == "" {
+		aboutShellPath = "/"
 	}
-	stdout, err := f.run(ctx, "df -k "+escapedPath)
+	fs.Debugf(f, "About path %q", aboutShellPath)
+	aboutShellPathArg := f.quoteOrEscapeShellPath(aboutShellPath)
+	// PowerShell
+	if f.remoteShell == "powershell" {
+		shellCmd := "Get-Item " + aboutShellPathArg + " -ErrorAction Stop|Select-Object -First 1 -ExpandProperty PSDrive|ForEach-Object{\"$($_.Used) $($_.Free)\"}"
+		fs.Debugf(f, "Running about shell command for shell type %q: %s", f.remoteShell, shellCmd)
+		stdout, err := f.run(ctx, shellCmd)
+		if err != nil {
+			fs.Debugf(f, "About shell command for shell type %q failed (set option remote_shell to override): %v", f.remoteShell, err)
+			return nil, errors.Wrap(err, "your remote may not support About")
+		}
+		split := strings.Fields(string(stdout))
+		usage := &fs.Usage{}
+		if len(split) == 2 {
+			usedValue, usedErr := strconv.ParseInt(split[0], 10, 64)
+			if usedErr == nil {
+				usage.Used = fs.NewUsageValue(usedValue)
+			}
+			freeValue, freeErr := strconv.ParseInt(split[1], 10, 64)
+			if freeErr == nil {
+				usage.Free = fs.NewUsageValue(freeValue)
+				if usedErr == nil {
+					usage.Total = fs.NewUsageValue(usedValue + freeValue)
+				}
+			}
+		}
+		return usage, nil
+	}
+	// Unix/default shell
+	shellCmd := "df -k " + aboutShellPathArg
+	fs.Debugf(f, "Running about shell command for shell type %q: %s", f.remoteShell, shellCmd)
+	stdout, err := f.run(ctx, shellCmd)
 	if err != nil {
+		fs.Debugf(f, "About shell command for shell type %q failed (set option remote_shell to override): %v", f.remoteShell, err)
 		return nil, errors.Wrap(err, "your remote may not support About")
 	}
-
 	usageTotal, usageUsed, usageAvail := parseUsage(stdout)
 	usage := &fs.Usage{}
 	if usageTotal >= 0 {
@@ -1268,38 +1411,75 @@ func (o *Object) Hash(ctx context.Context, r hash.Type) (string, error) {
 	var stdout, stderr bytes.Buffer
 	session.Stdout = &stdout
 	session.Stderr = &stderr
-	escapedPath := shellEscape(o.path())
-	if o.fs.opt.PathOverride != "" {
-		escapedPath = shellEscape(path.Join(o.fs.opt.PathOverride, o.remote))
-	}
-	err = session.Run(hashCmd + " " + escapedPath)
-	fs.Debugf(nil, "sftp cmd = %s", escapedPath)
+	shellPathArg := o.fs.quoteOrEscapeShellPath(o.shellPath())
+	fs.Debugf(o, "Running %v hash shell command: %s %s", r, hashCmd, shellPathArg)
+	err = session.Run(hashCmd + " " + shellPathArg)
+	_ = session.Close()
 	if err != nil {
-		_ = session.Close()
-		fs.Debugf(o, "Failed to calculate %v hash: %v (%s)", r, err, bytes.TrimSpace(stderr.Bytes()))
+		fs.Debugf(o, "Failed to calculate %v hash: %v", r, err)
 		return "", nil
 	}
-
-	_ = session.Close()
-	b := stdout.Bytes()
-	fs.Debugf(nil, "sftp output = %q", b)
-	str := parseHash(b)
-	fs.Debugf(nil, "sftp hash = %q", str)
+	outBytes := stdout.Bytes()
+	fs.Debugf(o, "Command output: %s", outBytes)
+	hashString := parseHash(outBytes)
+	fs.Debugf(o, "Parsed hash: %s", hashString)
 	if r == hash.MD5 {
-		o.md5sum = &str
+		o.md5sum = &hashString
 	} else if r == hash.SHA1 {
-		o.sha1sum = &str
+		o.sha1sum = &hashString
 	}
-	return str, nil
+	return hashString, nil
 }
 
-var shellEscapeRegex = regexp.MustCompile("[^A-Za-z0-9_.,:/\\@\u0080-\uFFFFFFFF\n-]")
-
 // Escape a string s.t. it cannot cause unintended behavior
-// when sending it to a shell.
-func shellEscape(str string) string {
-	safe := shellEscapeRegex.ReplaceAllString(str, `\$0`)
+// when sending it to a Unix shell.
+func unixShellEscape(str string) string {
+	safe := unixShellEscapeRegex.ReplaceAllString(str, `\$0`)
 	return strings.Replace(safe, "\n", "'\n'", -1)
+}
+
+// quoteOrEscapeShellPath makes path a valid string argument in configured shell
+func (f *Fs) quoteOrEscapeShellPath(shellPath string) string {
+	if f.remoteShell == "powershell" {
+		return "'" + strings.Replace(shellPath, "'", "''", -1) + "'"
+	}
+	if f.remoteShell == "cmd" {
+		// By assuming str is a windows filepath we can simply wrap in double quotes,
+		// no characters that would need escaping are legal in paths.
+		return "\"" + shellPath + "\""
+	}
+	return unixShellEscape(shellPath)
+}
+
+// remotePath returns the native SFTP path of the file or directory at the remote given
+func (f *Fs) remotePath(remote string) string {
+	return path.Join(f.absRoot, remote)
+}
+
+// remoteShellPath returns the SSH shell path of the file or directory at the remote given
+func (f *Fs) remoteShellPath(remote string) string {
+	var shellPath string
+	if f.opt.PathOverride != "" {
+		shellPath = path.Join(f.opt.PathOverride, remote)
+		fs.Debugf(f, "Shell path redirected to %q with option path_override", shellPath)
+	} else {
+		shellPath = path.Join(f.absRoot, remote)
+		if f.remoteShell == "powershell" || f.remoteShell == "cmd" {
+			// If remote shell is powershell or cmd, then server is probably Windows.
+			// The sftp package converts everything to POSIX paths: Forward slashes, and
+			// absolute paths starts with a slash. An absolute path on a Windows server will
+			// then look like this "/C:/Windows/System32". We must remove the "/" prefix
+			// to make this a valid for shell commands. In case of PowerShell there is a
+			// possibility that it is a Unix server, with PowerShell Core shell, but assuming
+			// root folders with names such as "C:" are rare, we just take this risk,
+			// option path_override can always be used to work around corner cases.
+			if posixWinAbsPathRegex.MatchString(shellPath) {
+				shellPath = strings.TrimPrefix(shellPath, "/")
+				fs.Debugf(f, "Shell path adjusted to %q (set option path_override to override)", shellPath)
+			}
+		}
+	}
+	return shellPath
 }
 
 // Converts a byte array from the SSH session returned by
@@ -1350,9 +1530,14 @@ func (o *Object) ModTime(ctx context.Context) time.Time {
 	return o.modTime
 }
 
-// path returns the native path of the object
+// path returns the native SFTP path of the object
 func (o *Object) path() string {
-	return path.Join(o.fs.absRoot, o.remote)
+	return o.fs.remotePath(o.remote)
+}
+
+// shellPath returns the SSH shell path of the object
+func (o *Object) shellPath() string {
+	return o.fs.remoteShellPath(o.remote)
 }
 
 // setMetadata updates the info in the object from the stat result passed in
