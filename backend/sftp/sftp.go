@@ -1406,13 +1406,10 @@ func (o *Object) Remote() string {
 // Hash returns the selected checksum of the file
 // If no checksum is available it returns ""
 func (o *Object) Hash(ctx context.Context, r hash.Type) (string, error) {
-	o.fs.addSession() // Show session in use
-	defer o.fs.removeSession()
 	if o.fs.opt.DisableHashCheck {
 		return "", nil
 	}
 	_ = o.fs.Hashes()
-
 	var hashCmd string
 	if r == hash.MD5 {
 		if o.md5sum != nil {
@@ -1430,29 +1427,13 @@ func (o *Object) Hash(ctx context.Context, r hash.Type) (string, error) {
 	if hashCmd == "" || hashCmd == hashCommandNotSupported {
 		return "", hash.ErrUnsupported
 	}
-
-	c, err := o.fs.getSftpConnection(ctx)
-	if err != nil {
-		return "", errors.Wrap(err, "Hash get SFTP connection")
-	}
-	session, err := c.sshClient.NewSession()
-	o.fs.putSftpConnection(&c, err)
-	if err != nil {
-		return "", errors.Wrap(err, "Hash put SFTP connection")
-	}
-
-	var stdout, stderr bytes.Buffer
-	session.Stdout = &stdout
-	session.Stderr = &stderr
 	shellPathArg := o.fs.quoteOrEscapeShellPath(o.shellPath())
 	fs.Debugf(o, "Running %v hash shell command: %s %s", r, hashCmd, shellPathArg)
-	err = session.Run(hashCmd + " " + shellPathArg)
-	_ = session.Close()
+	outBytes, err := o.fs.run(ctx, hashCmd+" "+shellPathArg)
 	if err != nil {
 		fs.Debugf(o, "Failed to calculate %v hash: %v", r, err)
 		return "", nil
 	}
-	outBytes := stdout.Bytes()
 	fs.Debugf(o, "Command output: %s", outBytes)
 	hashString := parseHash(outBytes)
 	fs.Debugf(o, "Parsed hash: %s", hashString)
