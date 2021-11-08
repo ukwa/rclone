@@ -263,6 +263,48 @@ func (f *Fs) Purge(ctx context.Context, dir string) error {
 	return f.client.RemoveAll(realpath)
 }
 
+// Move src to this remote using server-side move operations.
+//
+// This is stored with the remote path given
+//
+// It returns the destination Object and a possible error
+//
+// Will only be called if src.Fs().Name() == f.Name()
+//
+// If it isn't possible then return fs.ErrorCantMove
+func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object, error) {
+	srcObj, ok := src.(*Object)
+	if !ok {
+		fs.Debugf(src, "Can't move - not same remote type")
+		return nil, fs.ErrorCantMove
+	}
+
+	// Get the real paths from the remote specs:
+	sourcePath := f.realpath(srcObj.remote)
+	targetPath := f.realpath(remote)
+	fs.Debugf(f, "rename [%s] to [%s]", sourcePath, targetPath)
+
+	// Do the move
+	// Note that the underlying HDFS library hard-codes Overwrite=True, but this is expected rclone behaviour.
+	err := f.client.Rename(sourcePath, targetPath)
+	if err != nil {
+		return nil, err
+	}
+
+	// Look up the resulting object
+	info, err := f.client.Stat(targetPath)
+
+	// FIXME if srcObj.size != info.Size() throw an error
+
+	// And return it:
+	return &Object{
+		fs:      f,
+		remote:  remote,
+		size:    info.Size(),
+		modTime: info.ModTime(),
+	}, nil
+}
+
 // About gets quota information from the Fs
 func (f *Fs) About(ctx context.Context) (*fs.Usage, error) {
 	info, err := f.client.StatFs()
