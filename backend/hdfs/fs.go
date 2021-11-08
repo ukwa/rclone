@@ -263,6 +263,8 @@ func (f *Fs) Purge(ctx context.Context, dir string) error {
 	return f.client.RemoveAll(realpath)
 }
 
+// FIXME for DirMove, see https://github.com/rclone/rclone/blob/e43b5ce5e59b5717a9819ff81805dd431f710c10/backend/putio/fs.go#L602
+
 // Move src to this remote using server-side move operations.
 //
 // This is stored with the remote path given
