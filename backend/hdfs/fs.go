@@ -290,7 +290,7 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	dirname := path.Dir(targetPath)
 	err := f.client.MkdirAll(dirname, 0755)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	// Do the move
