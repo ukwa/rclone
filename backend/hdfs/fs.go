@@ -282,7 +282,8 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	}
 
 	// Get the real paths from the remote specs:
-	sourcePath := f.realpath(srcObj.remote)
+	fs.Debugf(f, "rename [%s] to [%s]", src.remote, remote)
+	sourcePath := src.realpath(src.remote)
 	targetPath := f.realpath(remote)
 	fs.Debugf(f, "rename [%s] to [%s]", sourcePath, targetPath)
 
