@@ -282,10 +282,16 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	}
 
 	// Get the real paths from the remote specs:
-	fs.Debugf(f, "rename [%s] to [%s]", src.remote, remote)
-	sourcePath := src.realpath(src.remote)
+	sourcePath := srcObj.fs.realpath(srcObj.remote)
 	targetPath := f.realpath(remote)
 	fs.Debugf(f, "rename [%s] to [%s]", sourcePath, targetPath)
+
+	// Make sure the target folder exists:
+	dirname := path.Dir(targetPath)
+	err := o.fs.client.MkdirAll(dirname, 0755)
+	if err != nil {
+		return err
+	}
 
 	// Do the move
 	// Note that the underlying HDFS library hard-codes Overwrite=True, but this is expected rclone behaviour.
