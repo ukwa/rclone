@@ -288,7 +288,7 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 
 	// Make sure the target folder exists:
 	dirname := path.Dir(targetPath)
-	err := o.fs.client.MkdirAll(dirname, 0755)
+	err := f.client.MkdirAll(dirname, 0755)
 	if err != nil {
 		return err
 	}
